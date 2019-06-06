@@ -7,8 +7,6 @@ import (
 	"ModuleModel/Constructor/DB/Driver"
 )
 
-
-
 var	ConnMysql Driver.MySql
 
 func init(){
