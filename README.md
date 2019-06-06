@@ -1,4 +1,4 @@
-# connectMySql
+# connect
 Mysql connection example
 
 ---
