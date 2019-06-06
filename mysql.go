@@ -1,4 +1,4 @@
-package Driver
+package mysql
 
 import (
 	"database/sql"
