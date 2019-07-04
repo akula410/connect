@@ -8,7 +8,7 @@ import (
 
 const DefaultConnName = "master"
 
-var conn map[string]*sql.DB
+var conn = make(map[string]*sql.DB)
 
 type MySql struct {
 	User string
