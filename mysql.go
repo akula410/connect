@@ -11,14 +11,14 @@ const DefaultConnName = "master"
 var conn map[string]*sql.DB
 
 type MySql struct {
-	User map[string]string
-	Password map[string]string
-	Host map[string]string
-	Port map[string]string
-	DBName map[string]string
-	Charset map[string]string
-	InterpolateParams map[string]bool
-	MaxOpenCoons map[string]int
+	User string
+	Password string
+	Host string
+	Port string
+	DBName string
+	Charset string
+	InterpolateParams bool
+	MaxOpenCoons int
 	connNumber string
 }
 
@@ -69,10 +69,9 @@ func (db *MySql) csr() string{
 
 
 func (db *MySql)getPass() string{
-	connNumber := db.GetConNumber()
 	var pass string
-	if db.Password[connNumber]!="" {
-		pass = fmt.Sprintf(":%s", db.Password[connNumber])
+	if db.Password!="" {
+		pass = fmt.Sprintf(":%s", db.Password)
 	} else {
 		pass = ""
 	}
@@ -80,10 +79,9 @@ func (db *MySql)getPass() string{
 }
 
 func (db *MySql)getCharset() string {
-	connNumber := db.GetConNumber()
 	var charset string
-	if db.Charset[connNumber]!="" {
-		charset = db.Charset[connNumber]
+	if db.Charset!="" {
+		charset = db.Charset
 	} else {
 		charset = "utf8"
 	}
@@ -92,9 +90,8 @@ func (db *MySql)getCharset() string {
 }
 
 func (db *MySql)getInterpolateParams() string{
-	connNumber := db.GetConNumber()
 	var param string
-	if db.InterpolateParams[connNumber] {
+	if db.InterpolateParams {
 		param = "true"
 	} else {
 		param = "false"
@@ -102,10 +99,9 @@ func (db *MySql)getInterpolateParams() string{
 	return param
 }
 func (db *MySql) GetMaxOpenCsr() int {
-	connNumber := db.GetConNumber()
 	var lifetime int
-	if db.MaxOpenCoons[connNumber] > 0 {
-		lifetime = db.MaxOpenCoons[connNumber]
+	if db.MaxOpenCoons > 0 {
+		lifetime = db.MaxOpenCoons
 	} else {
 		lifetime = 10
 	}
