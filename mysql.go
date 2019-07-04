@@ -6,29 +6,29 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-var conn []*sql.DB
+var conn map[string]*sql.DB
 
 type MySql struct {
-	User []string
-	Password []string
-	Host []string
-	Port []string
-	DBName []string
-	Charset []string
-	InterpolateParams []bool
-	MaxOpenCoons []int
-	connNumber int
+	User map[string]string
+	Password map[string]string
+	Host map[string]string
+	Port map[string]string
+	DBName map[string]string
+	Charset map[string]string
+	InterpolateParams map[string]bool
+	MaxOpenCoons map[string]int
+	connNumber string
 }
 
 
-func (db *MySql)SetConNumber(n int)*MySql{
+func (db *MySql)SetConNumber(n string)*MySql{
 	db.connNumber = n
 	return db
 }
 
-func (db *MySql)GetConNumber()int{
-	connNumber := 1
-	if db.connNumber > 0 {
+func (db *MySql)GetConNumber()string{
+	connNumber := "master"
+	if len(db.connNumber) > 0 {
 		connNumber = db.connNumber
 	}
 	return connNumber
@@ -44,6 +44,8 @@ func (db *MySql) Connect() *sql.DB {
 		if err != nil {
 			panic(err.Error())
 		}
+
+
 		conn[connNumber].SetMaxOpenConns(db.GetMaxOpenCsr())
 		err = conn[connNumber].Ping()
 
