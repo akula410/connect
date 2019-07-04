@@ -19,44 +19,44 @@ type MySql struct {
 	Charset string
 	InterpolateParams bool
 	MaxOpenCoons int
-	connNumber string
+	connName string
 }
 
 
-func (db *MySql)SetConNumber(n string)*MySql{
-	db.connNumber = n
+func (db *MySql)SetConnName(n string)*MySql{
+	db.connName = n
 	return db
 }
 
-func (db *MySql)GetConNumber()string{
+func (db *MySql)GetConnName()string{
 	connNumber := DefaultConnName
-	if len(db.connNumber) > 0 {
-		connNumber = db.connNumber
+	if len(db.connName) > 0 {
+		connNumber = db.connName
 	}
 	return connNumber
 }
 
 func (db *MySql) Connect() *sql.DB {
-	connNumber := db.GetConNumber()
+	connName := db.GetConnName()
 
-	if conn[connNumber]==nil {
+	if conn[connName]==nil {
 		var err error
-		conn[connNumber], err = sql.Open("mysql", db.csr())
+		conn[connName], err = sql.Open("mysql", db.csr())
 
 		if err != nil {
 			panic(err.Error())
 		}
 
 
-		conn[connNumber].SetMaxOpenConns(db.GetMaxOpenCsr())
-		err = conn[connNumber].Ping()
+		conn[connName].SetMaxOpenConns(db.GetMaxOpenCsr())
+		err = conn[connName].Ping()
 
 		if err != nil {
 			panic(err.Error())
 		}
 	}
 
-	return conn[connNumber]
+	return conn[connName]
 }
 
 
@@ -110,13 +110,13 @@ func (db *MySql) GetMaxOpenCsr() int {
 }
 
 func (db *MySql) Close(){
-	connNumber := db.GetConNumber()
-	if conn[connNumber]!=nil {
-		err := conn[connNumber].Close()
+	connName := db.GetConnName()
+	if conn[connName]!=nil {
+		err := conn[connName].Close()
 		if err != nil {
 			panic(err.Error())
 		}
-		conn[connNumber]=nil
+		conn[connName]=nil
 	}
 }
 
