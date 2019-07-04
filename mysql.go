@@ -6,6 +6,8 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
+const DefaultConnName = "master"
+
 var conn map[string]*sql.DB
 
 type MySql struct {
@@ -27,7 +29,7 @@ func (db *MySql)SetConNumber(n string)*MySql{
 }
 
 func (db *MySql)GetConNumber()string{
-	connNumber := "master"
+	connNumber := DefaultConnName
 	if len(db.connNumber) > 0 {
 		connNumber = db.connNumber
 	}
