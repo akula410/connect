@@ -27,17 +27,20 @@ type Config struct {
 	DBName string
 
 	// Charset is the connection character set. Defaults to "utf8mb4".
-	// Important: the charset is not sent to the MySQL driver directly. The effective
-	// character set is controlled by Collation — for example, "utf8mb4_unicode_ci"
-	// implies charset utf8mb4. Charset is stored for documentation and validation only.
+	// Informational only — not passed to the driver directly.
+	// The effective charset is controlled by Collation.
 	Charset string
 	// Collation is the connection collation sent in SET NAMES <charset> COLLATE <collation>.
-	// This controls both the character set and the sort order. Defaults to "utf8mb4_unicode_ci".
+	// Controls both the character set and sort order. Defaults to "utf8mb4_unicode_ci".
 	Collation string
 	// ParseTime enables automatic parsing of DATE and DATETIME values into time.Time.
-	// NormalizeConfig always defaults this to true. To use ParseTime=false, set it
-	// explicitly on the Config after calling NormalizeConfig.
+	// NormalizeConfig defaults this to true unless DisableParseTime is set.
 	ParseTime bool
+	// DisableParseTime explicitly disables automatic parsing of DATE/DATETIME into time.Time.
+	// When true, NormalizeConfig sets ParseTime=false regardless of the ParseTime field value.
+	// Use this to opt out of parseTime=true, since false is the zero value for bool
+	// and cannot be distinguished from "not set" by NormalizeConfig.
+	DisableParseTime bool
 	// Loc is the IANA timezone location name used for time values. Defaults to "Local".
 	Loc string
 	// Timeout is the dial timeout. Defaults to 5s.
@@ -49,19 +52,28 @@ type Config struct {
 	// InterpolateParams enables client-side interpolation of query parameters.
 	// Not compatible with unsafe collations such as big5 or gbk.
 	InterpolateParams bool
+	// TLSConfig sets the TLS configuration name for the MySQL connection.
+	// Valid values: "true", "false", "skip-verify", or a name registered with
+	// mysql.RegisterTLSConfig. Leave empty to use the driver default (no TLS).
+	TLSConfig string
 
 	// MaxOpenConns is the maximum number of open connections in the pool. Defaults to 25.
 	MaxOpenConns int
 	// MaxIdleConns is the maximum number of idle connections in the pool. Defaults to 25.
+	// Keep this value equal to MaxOpenConns for high-throughput applications to avoid
+	// connection churn when idle connections are reaped and reopened.
 	MaxIdleConns int
 	// ConnMaxLifetime is the maximum lifetime of a pooled connection. Defaults to 5m.
-	// Keep this below the MySQL wait_timeout to avoid stale connections.
+	// Keep this below the MySQL wait_timeout to avoid "packets out of order" errors
+	// on long-lived applications. MySQL default wait_timeout is 8 hours.
 	ConnMaxLifetime time.Duration
 	// ConnMaxIdleTime is the maximum idle time of a pooled connection. Defaults to 5m.
 	ConnMaxIdleTime time.Duration
 }
 
 // DefaultConfig returns a Config with safe production defaults for MySQL 8.
+// These defaults are a reasonable starting point but must be tuned for your workload.
+// See the README section "Connection pool sizing for high-load applications".
 func DefaultConfig() Config {
 	return Config{
 		Host:            "127.0.0.1",
@@ -81,11 +93,12 @@ func DefaultConfig() Config {
 }
 
 // NormalizeConfig fills zero-value fields with safe defaults from DefaultConfig.
-// User, Password, and DBName are never overwritten.
+// User, Password, DBName, DisableParseTime, TLSConfig, and InterpolateParams are never overwritten.
 //
-// ParseTime is always defaulted to true. Because false is the zero value for bool,
-// NormalizeConfig cannot distinguish "not set" from "explicitly false".
-// To use ParseTime=false, set cfg.ParseTime = false after calling NormalizeConfig.
+// ParseTime defaults to true unless DisableParseTime is explicitly set to true.
+// Because false is the zero value for bool, NormalizeConfig cannot distinguish
+// "not set" from "explicitly false" for ParseTime alone. Use DisableParseTime=true
+// to explicitly request parseTime=false in the DSN.
 func NormalizeConfig(cfg Config) Config {
 	d := DefaultConfig()
 	if cfg.Host == "" {
@@ -100,7 +113,9 @@ func NormalizeConfig(cfg Config) Config {
 	if cfg.Collation == "" {
 		cfg.Collation = d.Collation
 	}
-	if !cfg.ParseTime {
+	if cfg.DisableParseTime {
+		cfg.ParseTime = false
+	} else if !cfg.ParseTime {
 		cfg.ParseTime = d.ParseTime
 	}
 	if cfg.Loc == "" {
@@ -186,5 +201,8 @@ func buildMySQLConfig(cfg Config) (*mysql.Config, error) {
 	mc.Timeout = cfg.Timeout
 	mc.ReadTimeout = cfg.ReadTimeout
 	mc.WriteTimeout = cfg.WriteTimeout
+	if cfg.TLSConfig != "" {
+		mc.TLSConfig = cfg.TLSConfig
+	}
 	return mc, nil
 }

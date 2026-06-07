@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +41,9 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if !cfg.ParseTime {
 		t.Error("ParseTime: want true")
+	}
+	if cfg.DisableParseTime {
+		t.Error("DisableParseTime: want false")
 	}
 	if cfg.Timeout != 5*time.Second {
 		t.Errorf("Timeout: got %v, want 5s", cfg.Timeout)
@@ -121,6 +126,24 @@ func TestNormalizeConfig_ParseTimeCanBeDisabledAfterNormalize(t *testing.T) {
 	}
 }
 
+func TestNormalizeConfig_DisableParseTime(t *testing.T) {
+	cfg := NormalizeConfig(Config{User: "u", DBName: "db", DisableParseTime: true})
+	if cfg.ParseTime {
+		t.Error("ParseTime: should be false when DisableParseTime=true")
+	}
+	if !cfg.DisableParseTime {
+		t.Error("DisableParseTime: should remain true after NormalizeConfig")
+	}
+}
+
+func TestNormalizeConfig_DisableParseTime_OverridesExplicitTrue(t *testing.T) {
+	// DisableParseTime=true takes precedence even if ParseTime=true was also set.
+	cfg := NormalizeConfig(Config{User: "u", DBName: "db", ParseTime: true, DisableParseTime: true})
+	if cfg.ParseTime {
+		t.Error("ParseTime: DisableParseTime=true should override ParseTime=true")
+	}
+}
+
 func TestNormalizeConfig_CharsetIsInformational(t *testing.T) {
 	// Charset is stored but not passed to the driver directly;
 	// the effective charset is set by Collation.
@@ -131,6 +154,32 @@ func TestNormalizeConfig_CharsetIsInformational(t *testing.T) {
 	// Collation still defaults to utf8mb4_unicode_ci regardless of Charset.
 	if cfg.Collation != "utf8mb4_unicode_ci" {
 		t.Errorf("Collation: got %q, want utf8mb4_unicode_ci", cfg.Collation)
+	}
+}
+
+func TestNormalizeConfig_TLSConfig_Preserved(t *testing.T) {
+	cfg := NormalizeConfig(Config{User: "u", DBName: "db", TLSConfig: "skip-verify"})
+	if cfg.TLSConfig != "skip-verify" {
+		t.Errorf("TLSConfig: got %q, want skip-verify", cfg.TLSConfig)
+	}
+}
+
+func TestNormalizeConfig_Timeouts(t *testing.T) {
+	cfg := NormalizeConfig(Config{
+		User:         "u",
+		DBName:       "db",
+		Timeout:      10 * time.Second,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 60 * time.Second,
+	})
+	if cfg.Timeout != 10*time.Second {
+		t.Errorf("Timeout: got %v, want 10s", cfg.Timeout)
+	}
+	if cfg.ReadTimeout != 60*time.Second {
+		t.Errorf("ReadTimeout: got %v, want 60s", cfg.ReadTimeout)
+	}
+	if cfg.WriteTimeout != 60*time.Second {
+		t.Errorf("WriteTimeout: got %v, want 60s", cfg.WriteTimeout)
 	}
 }
 
@@ -222,6 +271,16 @@ func TestDSN_ParseTime(t *testing.T) {
 	}
 }
 
+func TestDSN_ParseTimeFalseViaDisableParseTime(t *testing.T) {
+	dsn, err := DSN(Config{User: "u", DBName: "db", DisableParseTime: true})
+	if err != nil {
+		t.Fatalf("DSN: %v", err)
+	}
+	if strings.Contains(dsn, "parseTime=true") {
+		t.Errorf("DSN should not contain parseTime=true when DisableParseTime=true: %q", dsn)
+	}
+}
+
 func TestDSN_Collation(t *testing.T) {
 	dsn, err := DSN(Config{User: "u", DBName: "db"})
 	if err != nil {
@@ -257,6 +316,26 @@ func TestDSN_Timeouts(t *testing.T) {
 		if !strings.Contains(dsn, sub) {
 			t.Errorf("DSN missing %q in: %q", sub, dsn)
 		}
+	}
+}
+
+func TestDSN_TLSConfig(t *testing.T) {
+	dsn, err := DSN(Config{User: "u", DBName: "db", TLSConfig: "skip-verify"})
+	if err != nil {
+		t.Fatalf("DSN: %v", err)
+	}
+	if !strings.Contains(dsn, "tls=skip-verify") {
+		t.Errorf("DSN missing tls=skip-verify: %q", dsn)
+	}
+}
+
+func TestDSN_TLSConfig_Empty(t *testing.T) {
+	dsn, err := DSN(Config{User: "u", DBName: "db"})
+	if err != nil {
+		t.Fatalf("DSN: %v", err)
+	}
+	if strings.Contains(dsn, "tls=") {
+		t.Errorf("DSN should not contain tls= when TLSConfig is empty: %q", dsn)
 	}
 }
 
@@ -299,7 +378,7 @@ func TestClose_NilDB(t *testing.T) {
 	}
 }
 
-// ---- Manager ----
+// ---- Manager helpers ----
 
 // newTestManager creates a Manager that opens *sql.DB without pinging,
 // so tests run without a real MySQL server.
@@ -318,6 +397,8 @@ func newTestManager() *Manager {
 func validCfg() Config {
 	return Config{User: "u", Password: "p", DBName: "db"}
 }
+
+// ---- Manager basic tests ----
 
 func TestNewManager_NotNil(t *testing.T) {
 	m := NewManager()
@@ -390,6 +471,38 @@ func TestManager_Open_DifferentConfigReturnsError(t *testing.T) {
 	_, err := m.Open(context.Background(), "main", cfg2)
 	if err == nil {
 		t.Error("want error when reopening same name with different config")
+	}
+}
+
+func TestManager_Open_ConcurrentSameName(t *testing.T) {
+	// All goroutines open the same name with the same config concurrently.
+	// All should succeed and get back the same *sql.DB pointer.
+	m := newTestManager()
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	var successCount int64
+	var errCount int64
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			_, err := m.Open(context.Background(), "concurrent", validCfg())
+			if err != nil {
+				atomic.AddInt64(&errCount, 1)
+			} else {
+				atomic.AddInt64(&successCount, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if successCount != goroutines {
+		t.Errorf("expected %d successes, got %d (errors: %d)", goroutines, successCount, errCount)
+	}
+	if names := m.Names(); len(names) != 1 {
+		t.Errorf("expected 1 registered connection, got %d: %v", len(names), names)
 	}
 }
 
@@ -499,6 +612,55 @@ func TestManager_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
+// ---- Manager Stats ----
+
+func TestManager_Stats_Found(t *testing.T) {
+	m := newTestManager()
+	if _, err := m.Open(context.Background(), "main", validCfg()); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	_, ok := m.Stats("main")
+	if !ok {
+		t.Error("Stats: want true for existing connection")
+	}
+}
+
+func TestManager_Stats_NotFound(t *testing.T) {
+	m := newTestManager()
+	_, ok := m.Stats("nonexistent")
+	if ok {
+		t.Error("Stats: want false for missing connection")
+	}
+}
+
+func TestManager_StatsAll(t *testing.T) {
+	m := newTestManager()
+	for _, name := range []string{"a", "b"} {
+		cfg := Config{User: "u", Password: "p", DBName: name}
+		if _, err := m.Open(context.Background(), name, cfg); err != nil {
+			t.Fatalf("Open %q: %v", name, err)
+		}
+	}
+
+	all := m.StatsAll()
+	if len(all) != 2 {
+		t.Errorf("StatsAll: got %d entries, want 2", len(all))
+	}
+	for _, key := range []string{"a", "b"} {
+		if _, ok := all[key]; !ok {
+			t.Errorf("StatsAll: missing key %q", key)
+		}
+	}
+}
+
+func TestManager_StatsAll_Empty(t *testing.T) {
+	m := newTestManager()
+	all := m.StatsAll()
+	if len(all) != 0 {
+		t.Errorf("StatsAll on empty manager: got %d entries, want 0", len(all))
+	}
+}
+
 // ---- configsEqual ----
 
 func TestConfigsEqual_SameConfig(t *testing.T) {
@@ -513,6 +675,154 @@ func TestConfigsEqual_DifferentDBName(t *testing.T) {
 	b := NormalizeConfig(Config{User: "u", DBName: "db2"})
 	if configsEqual(a, b) {
 		t.Error("configsEqual: configs with different DBName should not be equal")
+	}
+}
+
+func TestConfigsEqual_DifferentTLSConfig(t *testing.T) {
+	a := NormalizeConfig(Config{User: "u", DBName: "db", TLSConfig: "true"})
+	b := NormalizeConfig(Config{User: "u", DBName: "db", TLSConfig: "skip-verify"})
+	if configsEqual(a, b) {
+		t.Error("configsEqual: configs with different TLSConfig should not be equal")
+	}
+}
+
+func TestConfigsEqual_DifferentDisableParseTime(t *testing.T) {
+	a := NormalizeConfig(Config{User: "u", DBName: "db"})
+	b := NormalizeConfig(Config{User: "u", DBName: "db", DisableParseTime: true})
+	if configsEqual(a, b) {
+		t.Error("configsEqual: configs with different DisableParseTime should not be equal")
+	}
+}
+
+// ---- Retry ----
+
+// mockDB returns a *sql.DB that is usable for tests without a real MySQL server.
+func mockDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("mysql", "u:p@/db")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	return db
+}
+
+func TestRetry_SuccessFirstAttempt(t *testing.T) {
+	calls := 0
+	open := func(_ context.Context, _ Config) (*sql.DB, error) {
+		calls++
+		return mockDB(t), nil
+	}
+
+	db, err := newMySQLContextWithRetryFunc(context.Background(), validCfg(),
+		RetryConfig{Attempts: 3}, open)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	db.Close()
+	if calls != 1 {
+		t.Errorf("expected 1 call, got %d", calls)
+	}
+}
+
+func TestRetry_SuccessAfterFailures(t *testing.T) {
+	calls := 0
+	open := func(_ context.Context, _ Config) (*sql.DB, error) {
+		calls++
+		if calls < 3 {
+			return nil, fmt.Errorf("connection refused (attempt %d)", calls)
+		}
+		return mockDB(t), nil
+	}
+
+	db, err := newMySQLContextWithRetryFunc(context.Background(), validCfg(),
+		RetryConfig{Attempts: 5, MinDelay: 0, MaxDelay: 0}, open)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	db.Close()
+	if calls != 3 {
+		t.Errorf("expected 3 calls, got %d", calls)
+	}
+}
+
+func TestRetry_StopsAfterMaxAttempts(t *testing.T) {
+	calls := 0
+	open := func(_ context.Context, _ Config) (*sql.DB, error) {
+		calls++
+		return nil, fmt.Errorf("connection refused")
+	}
+
+	_, err := newMySQLContextWithRetryFunc(context.Background(), validCfg(),
+		RetryConfig{Attempts: 4, MinDelay: 0, MaxDelay: 0}, open)
+	if err == nil {
+		t.Fatal("expected error after all attempts")
+	}
+	if calls != 4 {
+		t.Errorf("expected 4 calls, got %d", calls)
+	}
+}
+
+func TestRetry_StopsOnContextAlreadyCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	calls := 0
+	open := func(_ context.Context, _ Config) (*sql.DB, error) {
+		calls++
+		return nil, fmt.Errorf("connection refused")
+	}
+
+	_, err := newMySQLContextWithRetryFunc(ctx, validCfg(),
+		RetryConfig{Attempts: 5, MinDelay: 0, MaxDelay: 0}, open)
+	if err == nil {
+		t.Fatal("expected error when context is cancelled")
+	}
+	// Context already cancelled before first attempt: should not retry.
+	if calls > 1 {
+		t.Errorf("expected at most 1 call with pre-cancelled context, got %d", calls)
+	}
+}
+
+func TestRetry_StopsOnContextCancelledDuringRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	calls := 0
+	open := func(_ context.Context, _ Config) (*sql.DB, error) {
+		calls++
+		if calls == 2 {
+			cancel() // cancel during second attempt
+		}
+		return nil, fmt.Errorf("connection refused")
+	}
+
+	// Use a tiny delay to ensure the select fires context cancellation.
+	_, err := newMySQLContextWithRetryFunc(ctx, validCfg(),
+		RetryConfig{Attempts: 10, MinDelay: time.Millisecond, MaxDelay: time.Millisecond}, open)
+	if err == nil {
+		t.Fatal("expected error when context is cancelled")
+	}
+	// Should stop well before 10 attempts.
+	if calls >= 10 {
+		t.Errorf("expected retry to stop early on ctx cancel, got %d calls", calls)
+	}
+}
+
+func TestRetry_AttemptsOneOrLess(t *testing.T) {
+	for _, attempts := range []int{-1, 0, 1} {
+		calls := 0
+		open := func(_ context.Context, _ Config) (*sql.DB, error) {
+			calls++
+			return nil, fmt.Errorf("connection refused")
+		}
+
+		_, err := newMySQLContextWithRetryFunc(context.Background(), validCfg(),
+			RetryConfig{Attempts: attempts}, open)
+		if err == nil {
+			t.Fatalf("Attempts=%d: expected error", attempts)
+		}
+		if calls != 1 {
+			t.Errorf("Attempts=%d: expected exactly 1 call, got %d", attempts, calls)
+		}
 	}
 }
 

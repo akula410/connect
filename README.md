@@ -8,7 +8,9 @@ Production-ready MySQL connection helper for Go.
 - Opens and returns a configured `*sql.DB`.
 - Applies connection pool settings (`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`).
 - Verifies the connection with `PingContext` on startup.
-- Provides a concurrency-safe named connection manager.
+- Provides a concurrency-safe named connection manager (`Manager`).
+- Supports startup retry with exponential backoff (`NewMySQLContextWithRetry`).
+- Exposes pool statistics via `sql.DBStats`.
 - Works with `database/sql` directly.
 - Integrates with `github.com/akula410/builder` by supplying `*sql.DB`.
 
@@ -18,8 +20,11 @@ Production-ready MySQL connection helper for Go.
 - Does not build SQL queries.
 - Does not scan rows into structs.
 - Does not manage migrations.
-- Does not replace `database/sql`.
-- Does not silently reconnect in a hidden loop.
+- Does not implement its own connection pool (uses `database/sql`).
+- Does not silently reconnect in a hidden background loop.
+- Does not perform automatic failover.
+- Does not replace MySQL monitoring.
+- Does not auto-tune `MaxOpenConns`.
 
 ## Installation
 
@@ -34,103 +39,170 @@ import "github.com/akula410/connect/v2"
 ## Basic usage
 
 ```go
-package main
+db, err := connect.NewMySQLContext(ctx, connect.Config{
+    User:     "app_user",
+    Password: "app_password",
+    Host:     "127.0.0.1",
+    Port:     "3306",
+    DBName:   "app_db",
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
 
-import (
-    "context"
-    "log"
-    "time"
-
-    "github.com/akula410/connect/v2"
-)
-
-func main() {
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-
-    db, err := connect.NewMySQLContext(ctx, connect.Config{
-        User:     "app_user",
-        Password: "app_password",
-        Host:     "127.0.0.1",
-        Port:     "3306",
-        DBName:   "app_db",
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer db.Close()
-
-    // db is a *sql.DB — use it with database/sql normally.
-    var version string
-    if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
-        log.Fatal(err)
-    }
-    log.Println("MySQL version:", version)
+// db is a *sql.DB — use it with database/sql normally.
+var version string
+if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
+    log.Fatal(err)
 }
 ```
 
-## Usage with github.com/akula410/builder
-
-`connect` returns a `*sql.DB`. Pass it directly to `sqlbuilder.NewExecutor`:
+Or use `DefaultConfig()` to start from sensible defaults:
 
 ```go
-package main
+cfg := connect.DefaultConfig()
+cfg.User = "app_user"
+cfg.Password = "app_password"
+cfg.DBName = "app_db"
 
-import (
-    "context"
-    "log"
-    "time"
-
-    sqlbuilder "github.com/akula410/builder"
-    "github.com/akula410/connect/v2"
-)
-
-func main() {
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-
-    db, err := connect.NewMySQLContext(ctx, connect.Config{
-        User:     "app_user",
-        Password: "app_password",
-        Host:     "127.0.0.1",
-        Port:     "3306",
-        DBName:   "app_db",
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer db.Close()
-
-    // connect returns *sql.DB — pass it to the builder executor.
-    exec := sqlbuilder.NewExecutor(db)
-
-    rows, err := exec.QueryContext(ctx,
-        sqlbuilder.Select("id", "name", "email").
-            From("users").
-            Where(sqlbuilder.Eq("status", "active")).
-            OrderBy("id", sqlbuilder.Desc).
-            Limit(10),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer rows.Close()
-
-    for rows.Next() {
-        var id int64
-        var name, email string
-        if err := rows.Scan(&id, &name, &email); err != nil {
-            log.Fatal(err)
-        }
-        log.Printf("user id=%d name=%s email=%s", id, name, email)
-    }
-}
+db, err := connect.NewMySQLContext(ctx, cfg)
 ```
 
-The `connect` package does not import `builder`. The integration is purely in application code:
-`connect` provides `*sql.DB`, `builder` consumes it via `sqlbuilder.NewExecutor(db)`.
+## Context-aware connection
 
-## Named connections
+Always use `NewMySQLContext` with a timeout for the startup ping:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+db, err := connect.NewMySQLContext(ctx, cfg)
+```
+
+`NewMySQL` is a convenience wrapper that uses `context.Background()`.
+
+## Pool configuration
+
+`database/sql` manages the connection pool. `connect` applies your settings immediately after opening:
+
+```go
+cfg := connect.DefaultConfig()
+cfg.User = "app_user"
+cfg.DBName = "app_db"
+
+cfg.MaxOpenConns    = 40
+cfg.MaxIdleConns    = 20
+cfg.ConnMaxLifetime = 5 * time.Minute
+cfg.ConnMaxIdleTime = 3 * time.Minute
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `MaxOpenConns` | 25 | Maximum open connections. Zero means no limit (dangerous in production). |
+| `MaxIdleConns` | 25 | Idle connections kept in the pool. Keep ≤ `MaxOpenConns`. |
+| `ConnMaxLifetime` | 5m | Max age of a connection. Set below MySQL `wait_timeout` to avoid stale connections. |
+| `ConnMaxIdleTime` | 5m | Max time a connection can sit idle before being closed. |
+
+**Important:** create `*sql.DB` once at application startup and share it. Do not create a new connection per HTTP request.
+
+## Connection pool sizing for high-load applications
+
+`DefaultConfig` is safe as a starting point but is not a universal production setting. Tune it for your MySQL instance, number of application instances, and query patterns.
+
+**Formula:**
+
+```
+MySQL max_connections      = 300
+Reserved (admin/system)    = 30
+Application instances      = 6
+
+Available per instance:
+(300 - 30) / 6 = 45
+
+Recommended starting point:
+MaxOpenConns = 40          (leave 5 headroom)
+MaxIdleConns = 10–25       (adjust based on traffic pattern)
+```
+
+**Rules of thumb:**
+
+- Set `MaxOpenConns` to the calculated available connections per instance.
+- Set `MaxIdleConns` equal to `MaxOpenConns` for steady high-throughput workloads. For bursty traffic, a lower value (10–15) reduces idle resource usage.
+- Keep `ConnMaxLifetime` well below MySQL `wait_timeout` (default 8 hours). 5 minutes is safe.
+- Short-lived queries (< 1ms) → larger pool. Long-running queries (> 100ms) → smaller pool, or you will exhaust it.
+- Monitor `sql.DBStats.WaitCount` and `WaitDuration`; high values indicate the pool is too small.
+
+## Timeouts
+
+```go
+cfg.Timeout      = 3 * time.Second   // dial timeout
+cfg.ReadTimeout  = 15 * time.Second  // I/O read timeout
+cfg.WriteTimeout = 15 * time.Second  // I/O write timeout
+```
+
+Tight timeouts prevent cascading failures under load. Adjust based on your slowest expected query time.
+
+## TLS
+
+Pass a TLS configuration name to enable encrypted connections:
+
+```go
+cfg.TLSConfig = "true"         // require TLS, verify server certificate
+cfg.TLSConfig = "skip-verify"  // require TLS, skip certificate verification
+cfg.TLSConfig = "false"        // disable TLS
+cfg.TLSConfig = "custom"       // a name registered via mysql.RegisterTLSConfig
+```
+
+Empty `TLSConfig` (the default) uses the driver default, which is no TLS for local connections.
+
+```go
+cfg := connect.DefaultConfig()
+cfg.User = "app_user"
+cfg.DBName = "app_db"
+cfg.TLSConfig = "skip-verify"
+
+db, err := connect.NewMySQLContext(ctx, cfg)
+```
+
+## Disabling ParseTime
+
+`NormalizeConfig` defaults `ParseTime` to `true`, which enables automatic parsing of `DATE`/`DATETIME` columns into `time.Time`. To disable it:
+
+```go
+cfg := connect.DefaultConfig()
+cfg.User = "app_user"
+cfg.DBName = "app_db"
+cfg.DisableParseTime = true   // results in parseTime=false in the DSN
+
+db, err := connect.NewMySQLContext(ctx, cfg)
+```
+
+Setting `ParseTime: false` directly on Config is not sufficient because `NormalizeConfig` cannot distinguish `false` (zero value) from "not set".
+
+## Retry on startup
+
+Use `NewMySQLContextWithRetry` when the application may start before MySQL is ready:
+
+```go
+retry := connect.RetryConfig{
+    Attempts: 5,
+    MinDelay: 500 * time.Millisecond,
+    MaxDelay: 5 * time.Second,
+}
+
+db, err := connect.NewMySQLContextWithRetry(ctx, cfg, retry)
+if err != nil {
+    log.Fatalf("could not connect after %d attempts: %v", retry.Attempts, err)
+}
+defer db.Close()
+```
+
+Retry uses exponential backoff: the delay starts at `MinDelay`, doubles after each failure, and is capped at `MaxDelay`. `Attempts <= 1` performs a single attempt with no retry. Retry stops immediately if the context is cancelled.
+
+**This is a startup-only mechanism.** Do not use it for runtime reconnection.
+
+## Manager for multiple connections
 
 Use `Manager` when an application needs multiple MySQL connections (e.g., master + read replica):
 
@@ -155,11 +227,69 @@ if err != nil {
     log.Fatal(err)
 }
 
-_, _ = master, replica
+// Retrieve a connection by name anywhere in your application.
+db, ok := manager.Get("master")
+
+// List all registered names (sorted).
+names := manager.Names()
 ```
 
 Reopening the same name with the same normalized Config returns the existing `*sql.DB`.
 Reopening with a different Config returns an error.
+
+Concurrent `Open` calls for the same name are safe: the mutex is released before the actual
+connection and ping so other goroutines are not blocked. If two goroutines race to open the
+same name, the slower one closes its extra connection and returns the winner's connection.
+
+## Stats / observability
+
+`*sql.DB` exposes pool statistics directly via `.Stats()`:
+
+```go
+stats := db.Stats()
+
+fmt.Println(stats.OpenConnections)  // total open connections
+fmt.Println(stats.InUse)            // connections currently executing a query
+fmt.Println(stats.Idle)             // connections waiting in the pool
+fmt.Println(stats.WaitCount)        // total goroutines that waited for a connection
+fmt.Println(stats.WaitDuration)     // total time spent waiting
+fmt.Println(stats.MaxIdleClosed)    // connections closed due to MaxIdleConns
+fmt.Println(stats.MaxLifetimeClosed) // connections closed due to ConnMaxLifetime
+```
+
+For `Manager`, use `Stats(name)` or `StatsAll()`:
+
+```go
+// Single named connection.
+if stats, ok := manager.Stats("master"); ok {
+    fmt.Println("master open:", stats.OpenConnections)
+}
+
+// All connections at once.
+for name, stats := range manager.StatsAll() {
+    fmt.Printf("%s: open=%d inuse=%d idle=%d waitCount=%d\n",
+        name, stats.OpenConnections, stats.InUse, stats.Idle, stats.WaitCount)
+}
+```
+
+No external monitoring libraries are required. To integrate with Prometheus, read `db.Stats()` periodically in a goroutine and record the values as gauges.
+
+## Graceful shutdown
+
+```go
+// Single connection.
+db, err := connect.NewMySQLContext(ctx, cfg)
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()   // release pool resources on exit
+
+// Manager.
+manager := connect.NewManager()
+defer manager.CloseAll()
+```
+
+`db.Close()` waits for in-flight queries to complete and then closes all idle connections. Do not call `db.Close()` after every query — close only on application shutdown.
 
 ## Health checks
 
@@ -179,9 +309,34 @@ func HealthHandler(db *sql.DB) http.HandlerFunc {
 }
 ```
 
-## Configuration
+## Usage with github.com/akula410/builder
 
-All fields are optional except `User` and `DBName`. `Host` and `Port` default to `127.0.0.1:3306`.
+`connect` returns a plain `*sql.DB`. Pass it directly to `sqlbuilder.NewExecutor`:
+
+```go
+db, err := connect.NewMySQLContext(ctx, cfg)
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
+
+exec := sqlbuilder.NewExecutor(db)
+
+rows, err := exec.QueryContext(ctx,
+    sqlbuilder.Select("id", "name", "email").
+        From("users").
+        Where(sqlbuilder.Eq("status", "active")).
+        OrderBy("id", sqlbuilder.Desc).
+        Limit(10),
+)
+```
+
+`connect` does not import `builder`. The integration lives entirely in application code:
+`connect` provides `*sql.DB`, `builder` consumes it.
+
+## Configuration reference
+
+All fields are optional except `User` and `DBName`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -190,57 +345,46 @@ All fields are optional except `User` and `DBName`. `Host` and `Port` default to
 | `Host` | `string` | `127.0.0.1` | MySQL server host. |
 | `Port` | `string` | `3306` | MySQL server port. |
 | `DBName` | `string` | — | **Required.** Database name. |
-| `Charset` | `string` | `utf8mb4` | Informational only — not sent to the driver directly. The effective charset is determined by `Collation` (e.g., `utf8mb4_unicode_ci` → charset `utf8mb4`). |
-| `Collation` | `string` | `utf8mb4_unicode_ci` | Sent as `SET NAMES <charset> COLLATE <collation>` on connect. Controls both the charset and sort order. |
-| `ParseTime` | `bool` | `true` | Parse DATE/DATETIME as `time.Time`. **`NormalizeConfig` always defaults this to `true`**; to use `ParseTime=false`, set it explicitly after calling `NormalizeConfig`. |
+| `Charset` | `string` | `utf8mb4` | Informational only — not sent to the driver directly. The effective charset is determined by `Collation`. |
+| `Collation` | `string` | `utf8mb4_unicode_ci` | Sent as `SET NAMES … COLLATE …`. Controls charset and sort order. |
+| `ParseTime` | `bool` | `true` | Parse DATE/DATETIME as `time.Time`. Defaulted to `true` by `NormalizeConfig`. |
+| `DisableParseTime` | `bool` | `false` | Explicitly set `parseTime=false`. Use instead of `ParseTime: false` which is indistinguishable from zero value. |
 | `Loc` | `string` | `Local` | IANA timezone for time values (e.g., `"UTC"`, `"Europe/Moscow"`). |
 | `Timeout` | `time.Duration` | `5s` | Connection dial timeout. |
 | `ReadTimeout` | `time.Duration` | `30s` | I/O read timeout. |
 | `WriteTimeout` | `time.Duration` | `30s` | I/O write timeout. |
 | `InterpolateParams` | `bool` | `false` | Client-side query parameter interpolation. |
-| `MaxOpenConns` | `int` | `25` | Max open connections in the pool. |
-| `MaxIdleConns` | `int` | `25` | Max idle connections in the pool. |
-| `ConnMaxLifetime` | `time.Duration` | `5m` | Max lifetime of a pooled connection. |
-| `ConnMaxIdleTime` | `time.Duration` | `5m` | Max idle time of a pooled connection. |
+| `TLSConfig` | `string` | `""` | TLS configuration name: `"true"`, `"false"`, `"skip-verify"`, or a registered name. |
+| `MaxOpenConns` | `int` | `25` | Max open connections. |
+| `MaxIdleConns` | `int` | `25` | Max idle connections. |
+| `ConnMaxLifetime` | `time.Duration` | `5m` | Max connection lifetime. |
+| `ConnMaxIdleTime` | `time.Duration` | `5m` | Max connection idle time. |
 
-Call `connect.DefaultConfig()` to get all defaults as a value you can modify:
+## Examples
 
-```go
-cfg := connect.DefaultConfig()
-cfg.User = "app_user"
-cfg.DBName = "app_db"
+| Example | Description |
+|---|---|
+| `examples/basic/` | Simple single connection |
+| `examples/manager/` | Multiple named connections with Manager |
+| `examples/highload_config/` | Pool sizing for high-load workloads |
+| `examples/stats/` | Observability via sql.DBStats |
+| `examples/retry/` | Startup retry with exponential backoff |
+| `examples/healthcheck/` | HTTP health check endpoint |
+| `examples/with_builder/` | Integration with github.com/akula410/builder |
+
+All examples read credentials from environment variables:
+
+```bash
+export MYSQL_USER=app_user
+export MYSQL_PASSWORD=secret
+export MYSQL_HOST=127.0.0.1
+export MYSQL_PORT=3306
+export MYSQL_DATABASE=app_db
+
+go run examples/basic/main.go
 ```
 
-## Pool settings
-
-Connection pooling is managed by `database/sql`. `connect` applies your settings immediately after opening the DB:
-
-```go
-db.SetMaxOpenConns(cfg.MaxOpenConns)
-db.SetMaxIdleConns(cfg.MaxIdleConns)
-db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
-db.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
-```
-
-**`MaxOpenConns`** — maximum number of open connections to the database. Zero means no limit. Default 25 works for most web services.
-
-**`MaxIdleConns`** — maximum number of idle connections retained in the pool. Keep it ≤ `MaxOpenConns`. Default 25.
-
-**`ConnMaxLifetime`** — maximum time a connection may be reused. Set this below MySQL's `wait_timeout` (default 8 hours) to avoid "packets out of order" errors on long-lived applications. Default 5m.
-
-**`ConnMaxIdleTime`** — maximum time a connection may sit idle before being closed. Default 5m.
-
-## Production recommendations
-
-- Use `context.WithTimeout` for the initial connection check.
-- Set `ConnMaxLifetime` below MySQL `wait_timeout` (default 8h). 5 minutes is safe.
-- Use `utf8mb4` and `utf8mb4_unicode_ci` — they support all Unicode characters including emoji.
-- Never log `connect.DSN(cfg)` output or full DSN strings; they contain the password.
-- Close the DB gracefully on shutdown: `defer db.Close()`.
-- Tune `MaxOpenConns` based on your MySQL `max_connections` and number of application instances.
-- Do not share a single `*sql.DB` across services or processes — create one per application.
-
-## Migrating from v1
+## Migration from v1
 
 v1 used a `MySql` struct with panic-based error handling and a global connection map.
 
@@ -260,8 +404,6 @@ db, err := connect.NewMySQLContext(ctx, connect.Config{
 })
 ```
 
-Key changes:
-
 | v1 | v2 |
 |---|---|
 | `MySql` struct | `Config` struct |
@@ -270,6 +412,8 @@ Key changes:
 | charset default `utf8` | charset default `utf8mb4` |
 | global `map[string]*sql.DB` | concurrency-safe `Manager` |
 | no context support | full `context.Context` support |
+| no retry | `NewMySQLContextWithRetry` |
+| no stats API | `Manager.Stats` / `Manager.StatsAll` |
 
 ## Security notes
 
